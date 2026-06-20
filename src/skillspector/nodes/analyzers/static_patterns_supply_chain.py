@@ -35,7 +35,7 @@ from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
 from .common import get_context, get_line_number
-from .osv_client import ECOSYSTEM_NPM, ECOSYSTEM_PYPI, VulnResult, query_batch
+from .osv_client import ECOSYSTEM_NPM, ECOSYSTEM_PYPI, VulnResult, query_batch, was_osv_reachable
 from .pattern_defaults import PatternCategory
 from .static_runner import analyzer_finding_to_finding
 
@@ -713,6 +713,23 @@ def _analyze_dependencies(
     if fallback_findings:
         logger.debug(
             "SC4: using static fallback for %d uncovered packages", len(uncovered_packages)
+        )
+    elif uncovered_packages and not osv_findings and not was_osv_reachable():
+        # OSV.dev was unreachable and fallback found nothing — surface the gap
+        findings.append(
+            AnalyzerFinding(
+                rule_id="SC4",
+                message=(
+                    "🟡 SC4: OSV.dev unreachable, using static fallback (24 packages). "
+                    "Results may be incomplete. Set SKILLSPECTOR_OSV_TIMEOUT to increase "
+                    "timeout or check network connectivity to api.osv.dev."
+                ),
+                severity=Severity.LOW,
+                location=Location(file=file_path, start_line=1),
+                confidence=1.0,
+                tags=tag,
+                matched_text="SC4 fallback active",
+            )
         )
     findings.extend(fallback_findings)
 

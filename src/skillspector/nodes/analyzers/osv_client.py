@@ -24,6 +24,7 @@ See https://google.github.io/osv.dev/post-v1-querybatch/ for API docs.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -36,7 +37,11 @@ logger = get_logger(__name__)
 
 _OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 _OSV_VULN_URL = "https://api.osv.dev/v1/vulns"
-_REQUEST_TIMEOUT = 10.0
+_REQUEST_TIMEOUT = float(os.environ.get("SKILLSPECTOR_OSV_TIMEOUT", 30.0))
+
+# Tracks whether the last query_batch() API call succeeded.
+# Used by the supply-chain analyzer to surface fallback warnings.
+_last_query_ok: bool = True
 
 # Ecosystem identifiers expected by OSV.dev (case-sensitive).
 ECOSYSTEM_PYPI = "PyPI"
@@ -254,6 +259,8 @@ def query_batch(
             resp.raise_for_status()
             batch_results = resp.json().get("results", [])
 
+        _last_query_ok = True
+
         for batch_idx, idx in enumerate(uncached_indices):
             if batch_idx >= len(batch_results):
                 break
@@ -261,6 +268,7 @@ def query_batch(
             if not vulns_raw:
                 name, version = packages[idx]
                 _put_cache(_cache_key(name, version, ecosystem), [])
+                logger.info("OSV.dev: no vulnerabilities found for %s==%s (passed)", name, version or "unspecified")
                 continue
 
             vuln_ids = [v["id"] for v in vulns_raw if "id" in v]
@@ -272,6 +280,7 @@ def query_batch(
 
     except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as exc:
         logger.warning("OSV.dev API request failed, falling back to static data: %s", exc)
+        _last_query_ok = False
         return [[] for _ in packages]
 
     return all_results
@@ -280,7 +289,7 @@ def query_batch(
 def is_available() -> bool:
     """Quick connectivity check against the OSV.dev API (HEAD-like POST)."""
     try:
-        with httpx.Client(timeout=5.0) as client:
+        with httpx.Client(timeout=15.0) as client:
             resp = client.post(
                 _OSV_BATCH_URL,
                 json={"queries": [{"package": {"name": "pip", "ecosystem": "PyPI"}}]},
@@ -288,3 +297,12 @@ def is_available() -> bool:
             return resp.status_code == 200
     except (httpx.HTTPError, httpx.TimeoutException):
         return False
+
+
+def was_osv_reachable() -> bool:
+    """Return True if the last query_batch() call succeeded.
+
+    Callers can use this to decide whether to surface a fallback warning
+    when query_batch returns empty results.
+    """
+    return _last_query_ok
