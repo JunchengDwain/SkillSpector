@@ -63,7 +63,10 @@ class MetaAnalyzerFinding(BaseModel):
         description="The end line number from the finding's Location, if available.",
     )
     is_vulnerability: bool = Field(description="Whether this is a true vulnerability")
-    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0")
+    # No ge/le bound on purpose: Pydantic bounds emit JSON-schema
+    # minimum/maximum, which some OpenAI-compatible structured-output endpoints
+    # reject. The range is enforced by the validator below instead.
+    confidence: float = Field(description="Confidence score between 0.0 and 1.0")
     intent: Literal["malicious", "negligent", "benign"] = Field(
         description="Likely intent behind the finding"
     )
@@ -72,6 +75,13 @@ class MetaAnalyzerFinding(BaseModel):
     )
     explanation: str = Field(default="", description="Why this is dangerous (2-3 sentences)")
     remediation: str = Field(default="", description="How to fix the issue (actionable steps)")
+
+    @field_validator("confidence")
+    @classmethod
+    def _clamp_confidence(cls, v: float) -> float:
+        # Clamp into [0.0, 1.0] so a slightly out-of-range model value
+        # normalises instead of failing the structured-output parse.
+        return min(1.0, max(0.0, v))
 
 
 class OverallAssessment(BaseModel):
