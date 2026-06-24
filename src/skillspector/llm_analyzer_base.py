@@ -28,11 +28,13 @@ to ``None`` for raw-string mode.
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import BaseModel, Field, field_validator
 
 from skillspector.llm_utils import get_chat_model
@@ -41,6 +43,54 @@ from skillspector.model_info import get_max_input_tokens
 from skillspector.models import Finding
 
 logger = get_logger(__name__)
+
+# DeepSeek's ``response_format={"type": "json_object"}`` requires the prompt
+# to contain the substring ``json`` (case-insensitive).  When we route through
+# the prompt-driven JSON path we append this suffix so the constraint is met.
+# We also state the expected top-level wrapper explicitly because DeepSeek
+# sometimes returns a bare array otherwise, which would fail our Pydantic
+# validation that expects an object with a ``findings`` field.
+DEEPSEEK_JSON_PROMPT_SUFFIX = (
+    "\n\nReturn ONLY a single JSON object whose top level has a "
+    "\"findings\" key.  Example shape: {\"findings\": [...]}.  Output the "
+    "JSON object directly, with no markdown fences and no surrounding prose."
+)
+
+# Regex used to peel a JSON object/array out of a model response that ignored
+# ``response_format`` and wrapped its JSON in prose or code fences.
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+
+def _is_deepseek_model(llm: object) -> bool:
+    """True when *llm* was constructed against DeepSeek's OpenAI endpoint.
+
+    :mod:`skillspector.providers.chat_models` sets ``_skillspector_deepseek``
+    on every :class:`ChatOpenAI` whose base URL points at ``api.deepseek.com``.
+    We prefer that explicit tag; if it is missing we fall back to inspecting
+    ``model_kwargs`` and the (sometimes-private) client ``base_url`` for the
+    DeepSeek host.  The explicit tag exists because LangChain's ``ChatOpenAI``
+    does not expose the base URL reliably across versions.
+    """
+    if getattr(llm, "_skillspector_deepseek", False):
+        return True
+
+    model_kwargs = getattr(llm, "model_kwargs", None) or {}
+    response_format = model_kwargs.get("response_format")
+    if not (isinstance(response_format, dict) and response_format.get("type") == "json_object"):
+        return False
+
+    base_url_hint = ""
+    direct_base_url = getattr(llm, "base_url", None)
+    if direct_base_url:
+        base_url_hint = str(direct_base_url)
+    else:
+        client = getattr(llm, "openai_client", None) or getattr(llm, "client", None)
+        if client is not None:
+            base_url_hint = str(
+                getattr(getattr(client, "_client", client), "base_url", "") or ""
+            )
+    return "api.deepseek.com" in base_url_hint.lower()
 
 # OpenAI suggests ~4 chars per token for English text with BPE tokenizers.
 CHARS_PER_TOKEN = 4
@@ -222,6 +272,74 @@ def _message_text(response: object) -> str:
     return str(response.text)
 
 
+def _extract_json_payload(text: str) -> str:
+    """Best-effort extraction of a JSON object/array from a free-form string.
+
+    DeepSeek sometimes wraps its JSON in code fences or prefixes it with
+    prose even when ``response_format=json_object`` is set; we strip the
+    wrapping and return the JSON body.  Raises :class:`ValueError` if no
+    JSON fragment can be located.
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```\s*$", "", stripped)
+    for pattern in (_JSON_OBJECT_RE, _JSON_ARRAY_RE):
+        match = pattern.search(stripped)
+        if match:
+            return match.group(0)
+    raise ValueError(f"No JSON object/array found in LLM response: {text[:200]!r}")
+
+
+def _message_json(response: object) -> str:
+    """Return a JSON string from a chat response, handling DeepSeek quirks.
+
+    DeepSeek's reasoning-capable models (e.g. ``deepseek-v4-flash``) sometimes
+    return an empty ``content`` because they put the payload in
+    ``additional_kwargs['reasoning_content']``.  When ``content`` is empty
+    we fall back to that field.  We then strip code fences / surrounding
+    prose and normalise a top-level JSON array to ``{"findings": [...]}``
+    so downstream Pydantic validation always sees the wrapper object.
+    """
+    if not isinstance(response, AIMessage):
+        if not isinstance(response, BaseMessage):
+            raise TypeError(
+                f"Expected BaseMessage from chat model, got {type(response).__name__}"
+            )
+        return _extract_json_payload(str(response.text))
+
+    content = response.text or ""
+    if not content.strip():
+        reasoning = response.additional_kwargs.get("reasoning_content") or ""
+        content = reasoning
+    if not content.strip():
+        raise ValueError("LLM response has empty content and reasoning_content")
+    payload = _extract_json_payload(content)
+    return _wrap_array_as_findings(payload)
+
+
+def _wrap_array_as_findings(payload: str) -> str:
+    """If *payload* is a top-level JSON array, wrap it as ``{"findings": [...]}``.
+
+    Some prompts (notably the meta-analyzer's batch-level finding list) cause
+    DeepSeek to emit a bare array.  Downstream Pydantic schemas always expect
+    an object with a ``findings`` field, so we normalise here.  Arrays of
+    primitives are passed through unchanged — callers that expect a primitive
+    response would not have a schema, so the validation step would have no
+    field requirements to violate.
+    """
+    stripped = payload.lstrip()
+    if not stripped.startswith("["):
+        return payload
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return payload
+    if isinstance(data, list):
+        return json.dumps({"findings": data}, ensure_ascii=False)
+    return payload
+
+
 BASE_ANALYSIS_PROMPT = """\
 {analyzer_prompt}
 
@@ -272,9 +390,19 @@ class LLMAnalyzerBase:
         self.model = model
         self._input_budget = get_max_input_tokens(model)
         self._llm = get_chat_model(model=model)
-        self._structured_llm = (
-            self._llm.with_structured_output(self.response_schema) if self.response_schema else None
-        )
+        # DeepSeek does not implement OpenAI's ``response_format=json_schema``;
+        # using Pydantic-driven ``with_structured_output`` would inject
+        # json_schema and DeepSeek would reject it (400 ``response_format
+        # type is unavailable now``).  For DeepSeek endpoints we skip
+        # structured output entirely and instead rely on
+        # ``response_format={"type": "json_object"}`` set by
+        # ``providers.chat_models`` plus a prompt instruction that contains
+        # the substring ``json`` (DeepSeek's hard requirement).
+        self._is_deepseek = bool(self._llm) and _is_deepseek_model(self._llm)
+        if self._is_deepseek or not self.response_schema:
+            self._structured_llm = None
+        else:
+            self._structured_llm = self._llm.with_structured_output(self.response_schema)
 
     # -- Batching -----------------------------------------------------------
 
@@ -357,9 +485,102 @@ class LLMAnalyzerBase:
         """
         if isinstance(response, LLMAnalysisResult):
             return [f.to_finding(batch.file_path) for f in response.findings]
+        if isinstance(response, str):
+            parsed = self._validate_json_response(response)
+            return [f.to_finding(batch.file_path) for f in parsed.findings]
         raise NotImplementedError(
             "Override parse_response for custom response_schema or raw-string mode"
         )
+
+    # -- LLM invocation -----------------------------------------------------
+
+    def _invoke_llm(self, prompt: str) -> object:
+        """Invoke the chat model, routing DeepSeek through the prompt-driven JSON path.
+
+        For DeepSeek the raw JSON response is validated against
+        :attr:`response_schema` and the resulting Pydantic instance is
+        returned — same shape as ``with_structured_output`` would have
+        produced, so subclasses' ``parse_response`` (which expect a Pydantic
+        object) keep working unchanged.
+
+        DeepSeek's reasoning models occasionally exhaust ``max_tokens`` on
+        internal chain-of-thought and return an empty ``content``.  When that
+        happens we retry once with the schema-instruction suffix stripped so
+        the model has more output budget for the actual JSON payload.
+        """
+        if self._structured_llm is not None:
+            return self._structured_llm.invoke(prompt)
+        if self._is_deepseek and self.response_schema is not None:
+            wrapped = self._wrap_prompt(prompt)
+            response = self._llm.invoke(wrapped)
+            try:
+                raw = _message_json(response)
+            except ValueError as exc:
+                logger.warning(
+                    "DeepSeek returned empty content; retrying with stripped suffix: %s",
+                    exc,
+                )
+                response = self._llm.invoke(prompt)
+                raw = _message_json(response)
+            return self._validate_json_response(raw)
+        return _message_text(self._llm.invoke(prompt))
+
+    async def _ainvoke_llm(self, prompt: str) -> object:
+        """Async variant of :meth:`_invoke_llm`."""
+        if self._structured_llm is not None:
+            return await self._structured_llm.ainvoke(prompt)
+        if self._is_deepseek and self.response_schema is not None:
+            wrapped = self._wrap_prompt(prompt)
+            response = await self._llm.ainvoke(wrapped)
+            try:
+                raw = _message_json(response)
+            except ValueError as exc:
+                logger.warning(
+                    "DeepSeek returned empty content; retrying with stripped suffix: %s",
+                    exc,
+                )
+                response = await self._llm.ainvoke(prompt)
+                raw = _message_json(response)
+            return self._validate_json_response(raw)
+        return _message_text(await self._llm.ainvoke(prompt))
+
+    def _wrap_prompt(self, prompt: str) -> str:
+        """Append the DeepSeek JSON suffix + schema so the prompt contains ``json``.
+
+        DeepSeek's ``response_format={"type":"json_object"}`` mode rejects the
+        request (400) unless the prompt contains the substring ``json`` (case
+        insensitive).  We also embed the JSON Schema of
+        :attr:`response_schema` because DeepSeek cannot enforce it on the
+        server side — the model needs to see the field names and types to
+        emit a conformant payload.  ``DEEPSEEK_JSON_PROMPT_SUFFIX`` is
+        idempotent: repeated calls cheaply short-circuit.
+        """
+        if DEEPSEEK_JSON_PROMPT_SUFFIX.strip().lower() in prompt.lower():
+            return prompt
+        schema_block = ""
+        if self.response_schema is not None:
+            try:
+                schema_text = json.dumps(
+                    self.response_schema.model_json_schema(), indent=2, ensure_ascii=False
+                )
+            except Exception:
+                schema_text = ""
+            if schema_text:
+                schema_block = (
+                    "\n\nRequired JSON Schema (your response MUST match these "
+                    "field names and types):\n```json\n" + schema_text + "\n```"
+                )
+        return prompt + DEEPSEEK_JSON_PROMPT_SUFFIX + schema_block
+
+    def _validate_json_response(self, response: str) -> LLMAnalysisResult:
+        """Parse a JSON-string LLM response into :class:`LLMAnalysisResult`."""
+        try:
+            data = json.loads(response)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"LLM response is not valid JSON: {exc}; payload={response[:200]!r}") from exc
+        if self.response_schema is None:
+            return LLMAnalysisResult()
+        return self.response_schema.model_validate(data)
 
     # -- Run loop -----------------------------------------------------------
 
@@ -383,10 +604,7 @@ class LLMAnalyzerBase:
                 estimate_tokens(prompt),
                 len(batch.findings),
             )
-            if self._structured_llm:
-                response = self._structured_llm.invoke(prompt)
-            else:
-                response = _message_text(self._llm.invoke(prompt))
+            response = self._invoke_llm(prompt)
             logger.debug("LLM response for %s", batch.file_label)
             parsed = self.parse_response(response, batch)
             results.append((batch, parsed))
@@ -418,10 +636,7 @@ class LLMAnalyzerBase:
                     estimate_tokens(prompt),
                     len(batch.findings),
                 )
-                if self._structured_llm:
-                    response = await self._structured_llm.ainvoke(prompt)
-                else:
-                    response = _message_text(await self._llm.ainvoke(prompt))
+                response = await self._ainvoke_llm(prompt)
                 logger.debug("LLM response for %s", batch.file_label)
                 return (batch, self.parse_response(response, batch))
 
